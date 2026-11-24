@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>单卷虚拟磁盘整理</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --line:#2b3852; --fg:#e6ebf5;
+          --muted:#93a0b8; --accent:#4f8cff; --ok:#37b26b; --warn:#e6a23c;
+          --err:#f05c6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns:360px 1fr; gap:16px;
+         padding:16px 24px; }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:10px; padding:16px; }
+  .card h2 { margin:0 0 12px; font-size:14px; color:var(--accent); }
+  dl { display:grid; grid-template-columns:110px 1fr; gap:4px 8px;
+       margin:0; font-size:13px; }
+  dt { color:var(--muted); } dd { margin:0; word-break:break-all; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+  input,button { font:inherit; border-radius:6px; border:1px solid var(--line);
+                 padding:7px 10px; background:#111827; color:var(--fg); }
+  input { width:110px; }
+  button { cursor:pointer; background:var(--accent); border-color:var(--accent);
+           color:#fff; }
+  button.secondary { background:#243049; border-color:var(--line); color:var(--fg); }
+  button.danger { background:#3a2230; border-color:#5a2f3d; color:#ffb3bd; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px;
+           font-size:12px; }
+  .badge.idle { background:rgba(55,178,107,.18); color:var(--ok); }
+  .badge.compacting { background:rgba(79,140,255,.18); color:var(--accent); }
+  .badge.error { background:rgba(240,92,107,.18); color:var(--err); }
+  #slots { display:grid; grid-template-columns:repeat(10,1fr); gap:6px; }
+  .slot { aspect-ratio:1; border-radius:6px; display:flex;
+          align-items:center; justify-content:center; font-size:11px;
+          border:1px solid var(--line); background:#111827; color:var(--muted);
+          font-variant-numeric:tabular-nums; position:relative; }
+  .slot.used { background:rgba(79,140,255,.16); color:#cfe0ff;
+               border-color:#34507f; }
+  .slot.packed { background:rgba(55,178,107,.18); color:#b7f0cf;
+                 border-color:#2c6b47; }
+  .slot .idx { position:absolute; top:1px; left:4px; font-size:9px;
+               color:var(--muted); }
+  .msg { margin-top:10px; font-size:12px; min-height:18px; color:var(--muted);
+         white-space:pre-wrap; word-break:break-all; }
+  .msg.err { color:var(--err); } .msg.ok { color:var(--ok); }
+  pre { background:#0c1322; border:1px solid var(--line); border-radius:8px;
+        padding:10px; overflow:auto; font-size:12px; margin:8px 0 0; }
+  .hint { color:var(--muted); font-size:12px; margin:6px 0 0; }
+  @media (max-width:900px){ main{grid-template-columns:1fr} #slots{grid-template-columns:repeat(5,1fr)} }
+</style>
+</head>
+<body>
+<header>
+  <h1>单卷虚拟磁盘整理台</h1>
+  <p>按逻辑块号读取 4 KiB · 启动整理回收尾部空间 · 整理期间读请求不中断 · 崩溃重启自动续作</p>
+</header>
+<main>
+  <section class="card">
+    <h2>操作</h2>
+    <div class="row">
+      <input id="lbn" type="number" min="0" value="0" aria-label="逻辑块号">
+      <button onclick="readBlock()">读 4 KiB</button>
+    </div>
+    <div class="row">
+      <button id="btnStart" onclick="startCompact()">启动整理</button>
+      <button class="secondary" onclick="refresh()">刷新状态</button>
+    </div>
+    <div class="row">
+      <button class="danger" onclick="inject('move')">注入：下一次搬移报错</button>
+      <button class="danger" onclick="inject('truncate')">注入：下一次截短报错</button>
+      <button class="secondary" onclick="reseed()">重建演示镜像</button>
+    </div>
+    <p class="hint">故障为一次性：报错后状态置为 error，数据仍可读，再点“启动整理”从游标续跑。</p>
+    <div id="msg" class="msg"></div>
+    <div id="readout"></div>
+  </section>
+
+  <section class="card">
+    <h2>卷状态</h2>
+    <dl>
+      <dt>状态</dt><dd><span id="state" class="badge idle">-</span></dd>
+      <dt>镜像路径</dt><dd id="path">-</dd>
+      <dt>实际文件长度</dt><dd id="fileSize">-</dd>
+      <dt>整理后目标长度</dt><dd id="targetSize">-</dd>
+      <dt>槽位 / 在用</dt><dd id="slotInfo">-</dd>
+      <dt>整理游标</dt><dd id="cursor">-</dd>
+      <dt>累计搬移次数</dt><dd id="moves">-</dd>
+      <dt>故障计数</dt><dd id="errors">-</dd>
+      <dt>头世代号</dt><dd id="generation">-</dd>
+      <dt>镜像外临时峰值</dt><dd id="tempPeak">-</dd>
+    </dl>
+    <h2 style="margin-top:16px">物理槽位图（绿=已压紧，蓝=在用，灰=空槽）</h2>
+    <div id="slots"></div>
+  </section>
+</main>
+
+<script>
+let timer = null;
+function say(text, cls) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg ' + (cls || '');
+}
+async function api(path, options) {
+  const r = await fetch(path, options);
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error || body.message || ('HTTP ' + r.status));
+  return body;
+}
+async function refresh() {
+  const s = await api('/api/status');
+  document.getElementById('state').textContent =
+    {idle:'空闲 idle', compacting:'整理中 compacting', error:'故障 error'}[s.state] || s.state;
+  document.getElementById('state').className = 'badge ' + s.state;
+  document.getElementById('path').textContent = s.path;
+  document.getElementById('fileSize').textContent =
+    s.file_size + ' 字节（' + (s.file_size/4096).toFixed(1) + ' 个 4KiB 块，含 2 块头）';
+  document.getElementById('targetSize').textContent =
+    s.expected_compact_size + ' 字节';
+  document.getElementById('slotInfo').textContent =
+    s.slot_count + ' / ' + s.used_count + '（逻辑块号：' + s.used_lbns.join(', ') + '）';
+  document.getElementById('cursor').textContent = s.cursor;
+  document.getElementById('moves').textContent = s.moves;
+  document.getElementById('errors').textContent = s.errors;
+  document.getElementById('generation').textContent = s.generation;
+  document.getElementById('tempPeak').textContent = s.max_temp_bytes + ' 字节';
+  document.getElementById('btnStart').disabled = (s.state === 'compacting');
+  const wrap = document.getElementById('slots');
+  wrap.innerHTML = '';
+  s.slots.forEach((entry, phys) => {
+    const div = document.createElement('div');
+    const packed = entry !== 0 && phys < s.used_count && s.state === 'idle';
+    div.className = 'slot ' + (packed ? 'packed' : entry ? 'used' : '');
+    div.title = entry ? ('物理槽 ' + phys + ' → 逻辑块 ' + (entry-1))
+                      : ('物理槽 ' + phys + '（空槽）');
+    div.innerHTML = '<span class="idx">' + phys + '</span>' +
+                    (entry ? (entry-1) : '空');
+    wrap.appendChild(div);
+  });
+  return s;
+}
+async function readBlock() {
+  const lbn = document.getElementById('lbn').value;
+  try {
+    const b = await api('/api/blocks/' + encodeURIComponent(lbn));
+    document.getElementById('readout').innerHTML =
+      '<h2 style="margin-top:14px">逻辑块 ' + b.lbn + '（' + b.size + ' 字节）</h2>' +
+      '<pre>前 64 字节（可打印视图）：\n' + b.preview +
+      '\n\n前 64 字节（hex）：\n' + b.hex + '</pre>';
+    say('读取成功', 'ok');
+  } catch (e) { say('读取失败：' + e.message, 'err'); }
+}
+async function startCompact() {
+  try { say((await api('/api/compact/start', {method:'POST'})).message, 'ok'); }
+  catch (e) { say(e.message, 'err'); }
+  refresh();
+}
+async function inject(kind) {
+  try { say((await api('/api/fault/' + kind, {method:'POST'})).message, 'ok'); }
+  catch (e) { say(e.message, 'err'); }
+}
+async function reseed() {
+  try { say((await api('/api/reseed', {method:'POST'})).message, 'ok'); refresh(); }
+  catch (e) { say(e.message, 'err'); }
+}
+async function loop() {
+  try { await refresh(); } catch (e) { say('状态刷新失败：' + e.message, 'err'); }
+}
+loop();
+timer = setInterval(loop, 1000);
+</script>
+</body>
+</html>

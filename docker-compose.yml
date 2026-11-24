@@ -1,0 +1,16 @@
+services:
+  disk-compactor:
+    build: .
+    image: disk-compactor:demo
+    container_name: disk-compactor
+    ports:
+      - "8000:8000"
+    environment:
+      # 放慢每次搬移，便于在网页上观察整理过程与中断窗口。
+      MOVE_DELAY: "0.5"
+    volumes:
+      - disk-data:/data
+    restart: "no"
+
+volumes:
+  disk-data:
