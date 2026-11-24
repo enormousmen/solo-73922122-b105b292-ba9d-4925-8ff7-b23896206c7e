@@ -7,6 +7,7 @@
   compact-once <img>         推进整理一步（打印是否完成）
   hard-exit <img>            进入整理态、推进一步后 os._exit 硬退出（模拟 SIGKILL）
   resume <img>               续跑整理直到完成
+  swap <img> <a> <b> <n>     对调逻辑地址区间 [a,a+n) ⇄ [b,b+n)（只改盘头）
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.disk import DATA_OFFSET, STATE_IDLE, Disk, lbn_to_slot  # noqa: E402
+from app.disk import (DATA_OFFSET, STATE_IDLE, Disk, DiskError,  # noqa: E402
+                      lbn_to_slot)
 from app.seed import block_content, build as build_seed  # noqa: E402
 
 
@@ -121,11 +123,35 @@ def cmd_resume(img: str) -> int:
         disk.close()
 
 
+def cmd_swap(img: str, a: int, b: int, count: int) -> int:
+    disk = Disk(img)
+    try:
+        try:
+            result = disk.swap_ranges(a, b, count)
+        except DiskError as exc:
+            print(f"对调被拒绝：{exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False))
+        return 0
+    finally:
+        disk.close()
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         print(__doc__)
         return 2
     command, img = argv[1], argv[2]
+    if command == "swap":
+        if len(argv) != 6:
+            print("usage: swap <img> <a> <b> <count>")
+            return 2
+        try:
+            a, b, count = int(argv[3]), int(argv[4]), int(argv[5])
+        except ValueError:
+            print("a、b、count 必须是整数")
+            return 2
+        return cmd_swap(img, a, b, count)
     handlers = {
         "seed": cmd_seed,
         "status": cmd_status,

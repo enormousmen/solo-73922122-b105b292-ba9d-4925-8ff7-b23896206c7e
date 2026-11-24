@@ -16,6 +16,10 @@
 - 搬一个块：数据先完整写入目标槽并 fsync，再提交新槽表。
   提交前所有读仍命中旧位置；提交后新位置已有完整数据。
 - 整理游标 cursor 随槽表一起持久化，进程中途退出后重启可从游标继续。
+- 逻辑地址对调（swap_ranges）只改写槽表，整批在一次头提交中生效：
+  中途退出重开只能看到交换前或交换后的完整布局，已提交的对调重启后
+  仍有效。对调保持各物理槽的空/满不变，因此可与整理搬移安全交错；
+  对调后游标归零，整理按新的逻辑块号顺序重新压紧。
 
 镜像外临时数据
 ==============
@@ -176,6 +180,12 @@ class Disk:
         self.inject_truncate_error = False
         self.move_delay = 0.0
         self.max_temp_seen = 0
+        # 对调世代号：每次逻辑地址对调 +1，仅进程内使用。
+        # 整理步骤用它检测“步骤执行期间插入了一次对调”，
+        # 从而放弃游标推进、按新映射重扫（对调已把游标归零）。
+        self._swap_epoch = 0
+        # 本进程内完成的对调次数（展示用，不持久化）。
+        self.swap_count = 0
         self._load_header()
 
     # ---------- 打开 / 创建 ----------
@@ -342,7 +352,12 @@ class Disk:
         return data
 
     def _move_block(self, src: int, dst: int) -> None:
-        """把 src 槽的数据经镜像外暂存搬到 dst，再原子提交槽表。"""
+        """把 src 槽的数据经镜像外暂存搬到 dst，再原子提交槽表。
+
+        与对调的交错：对调只改写槽表里的逻辑块号，不动数据、也不改变
+        槽位的空/满分布，因此 I/O 窗口内插入对调不影响本搬移的物理
+        前提；提交时登记源槽“当前”的逻辑块号即可，两个操作可交换。
+        """
         if self.inject_move_error:
             self.inject_move_error = False
             raise RuntimeError("injected move failure")
@@ -353,15 +368,16 @@ class Disk:
                 raise DiskError(f"source slot {src} is empty")
             if self.slots[dst] != 0:
                 raise DiskError(f"dest slot {dst} not free")
-            entry = self.slots[src]
         # I/O 放在写锁外：读路径仍可通过旧映射读到完整数据。
         data = self._read_slot(src)
         self._temp_hold(data)                 # 镜像外临时数据 ≤ 4 KiB
         self._write_slot(dst, data)           # 先落盘新位置并 fsync
         with self.lock.write_lock():
-            # 再次确认，期间只有本工作线程能改槽表（单工作线程模型）。
-            if self.slots[src] != entry or self.slots[dst] != 0:
+            # 对调保持空满不变：源槽仍应在用、目标槽仍应为空；
+            # 但源槽登记的逻辑块号可能刚被对调改写，取当前值。
+            if self.slots[src] == 0 or self.slots[dst] != 0:
                 raise DiskError("slot table changed unexpectedly")
+            entry = self.slots[src]
             self.slots[src] = 0
             self.slots[dst] = entry
             self.moves += 1
@@ -380,27 +396,36 @@ class Disk:
         不变量：进入游标 i 时，物理槽 0..i-1 已依次压紧 used[0..i-1]，
         其余 U-i 个在用块分布在槽 i..S-1 中。因 S>U，该区间恒有空槽，
         枢轴永远可得。每一步结束后槽 0..i 压紧、映射自洽。
+
+        与对调的交错：步骤开头在同一快照里记下对调世代号、游标与槽表；
+        若步骤执行期间插入对调（世代号变化），本步放弃游标推进/截短，
+        下一步按对调后的新映射重扫（对调已把游标归零，空步幂等）。
         """
-        with self.lock.write_lock():
-            if self.state != STATE_COMPACTING:
-                if self.state == STATE_IDLE:
-                    return True
-                raise DiskError(f"cannot compact in state {self.state}")
-            used = sorted(e - 1 for e in self.slots if e)
-            slot_count = self.slot_count
+        with self.lock.read_lock():
+            state = self.state
+            epoch0 = self._swap_epoch
             cursor = self.cursor
+            slot_count = self.slot_count
+            used = sorted(e - 1 for e in self.slots if e)
+            mapping = lbn_to_slot(self.slots)
+            dest_is_free = cursor < slot_count and self.slots[cursor] == 0
+
+        if state != STATE_COMPACTING:
+            if state == STATE_IDLE:
+                return True
+            raise DiskError(f"cannot compact in state {state}")
 
         if cursor < len(used):
             target_lbn = used[cursor]
-            with self.lock.read_lock():
-                mapping = lbn_to_slot(self.slots)
-                target_phys = mapping[target_lbn]
-                dest_is_free = self.slots[cursor] == 0
+            # 快照内一致：used 与 mapping 取自同一槽表，目标必然存在。
+            target_phys = mapping[target_lbn]
             if target_phys == cursor:
                 # 目标块已在正确槽位。
                 with self.lock.write_lock():
-                    self.cursor += 1
-                    self._commit()
+                    if self._swap_epoch == epoch0 and \
+                            self.cursor == cursor:
+                        self.cursor += 1
+                        self._commit()
                 return False
             if dest_is_free:
                 # 目标槽是空槽：目标块直接迁入。
@@ -412,11 +437,16 @@ class Disk:
                     raise DiskError("no free slot available for pivoting")
                 self._move_block(cursor, pivot)
                 with self.lock.read_lock():
-                    target_phys = lbn_to_slot(self.slots)[target_lbn]
+                    target_phys = lbn_to_slot(self.slots).get(
+                        target_lbn, -1)
+                if target_phys < 0:
+                    # 对调刚把目标块换成未分配：放弃本步，下步按新映射重扫。
+                    return False
                 self._move_block(target_phys, cursor)
             with self.lock.write_lock():
-                self.cursor += 1
-                self._commit()
+                if self._swap_epoch == epoch0 and self.cursor == cursor:
+                    self.cursor += 1
+                    self._commit()
             return False
 
         # 所有在用块已压紧到前 len(used) 个槽，截短尾部。
@@ -425,6 +455,9 @@ class Disk:
             self.inject_truncate_error = False
             raise RuntimeError("injected truncate failure")
         with self.lock.write_lock():
+            if self._swap_epoch != epoch0:
+                # 对调改了映射：先按新映射重新压紧，之后再截短。
+                return False
             # 截短前再校验一次，防止截掉在用数据。
             for phys in range(len(used), slot_count):
                 if self.slots[phys] != 0:
@@ -443,6 +476,64 @@ class Disk:
             self.errors += 1
             self.state = STATE_ERROR
             self._commit()
+
+    # ---------- 逻辑地址对调 ----------
+
+    # 槽表项为 int32：逻辑块号 + 1 必须落在正数范围内。
+    MAX_LBN = 2**31 - 2
+
+    def swap_ranges(self, start_a: int, start_b: int, count: int) -> dict:
+        """对调两段逻辑地址区间的映射，把备好的数据切到业务地址。
+
+        - 两段等长（count 块）且必须互不相交；区间外映射照旧；
+        - 未分配的逻辑位置随区间一起交换（交换后对面变为未分配）；
+        - 只改盘头槽表：物理槽与数据块不动，文件长度不变；
+        - 整批交换在一次头提交中生效：进程中途退出，重开只能看到
+          交换前或交换后的完整布局；已提交的对调重启后仍有效；
+        - 整理游标归零：整理随后按新的逻辑块号顺序重新压紧
+          （已压紧的块走空步，幂等）；整理停在任意中间态时也可对调。
+        """
+        if count < 1:
+            raise DiskError("块数必须 ≥ 1")
+        if start_a < 0 or start_b < 0:
+            raise DiskError("起始逻辑块号必须 ≥ 0")
+        lo, hi = sorted(((start_a, start_a + count),
+                         (start_b, start_b + count)))
+        if lo[1] > hi[0]:
+            raise DiskError(
+                f"区间 [{lo[0]},{lo[1]}) 与 [{hi[0]},{hi[1]}) 重叠")
+        if max(start_a, start_b) + count - 1 > self.MAX_LBN:
+            raise DiskError("逻辑块号超出槽表可编码范围")
+        with self.lock.write_lock():
+            if self._fd < 0:
+                raise DiskError("disk closed")
+            # 对调面向槽表仍有空槽的镜像（整理枢轴也依赖空槽）。
+            if 0 not in self.slots:
+                raise DiskError("镜像槽表无空槽，不支持对调")
+            mapping = lbn_to_slot(self.slots)
+            remapped = 0
+            for i in range(count):
+                la, lb = start_a + i, start_b + i
+                pa, pb = mapping.get(la), mapping.get(lb)
+                # 两段互不相交 ⇒ 各对涉及不同的物理槽，可逐对改写。
+                if pa is not None:
+                    self.slots[pa] = lb + 1
+                    remapped += 1
+                if pb is not None:
+                    self.slots[pb] = la + 1
+                    remapped += 1
+            self.cursor = 0
+            self._swap_epoch += 1
+            self.swap_count += 1
+            self._commit()
+            generation = self._gen
+        return {
+            "range_a": [start_a, start_a + count],
+            "range_b": [start_b, start_b + count],
+            "count": count,
+            "remapped_slots": remapped,
+            "generation": generation,
+        }
 
     # ---------- 状态快照 ----------
 
@@ -468,6 +559,7 @@ class Disk:
             "generation": gen,
             "file_size": self.file_size,
             "block_size": BLOCK_SIZE,
+            "swaps": self.swap_count,
             "expected_compact_size":
                 DATA_OFFSET + len(used) * BLOCK_SIZE,
             "max_temp_bytes": self.max_temp_seen,

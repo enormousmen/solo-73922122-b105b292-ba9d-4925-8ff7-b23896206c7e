@@ -5,6 +5,8 @@
 
 - 按**逻辑块号**读取 4 KiB 数据；
 - 一键启动**整理（compact）**，把在用块向镜像头部压紧并截短文件；
+- **对调逻辑地址**：把备用区备好的数据切到业务地址（只改盘头，整理途中
+  也可执行，同一操作可切回）；
 - 实时查看**实际文件长度**、槽位映射、整理游标与搬移次数；
 - 注入搬移/截短故障，观察“报错但数据仍可读、重试可续作”。
 
@@ -12,13 +14,13 @@
 
 ```
 app/
-  disk.py      镜像格式、双份崩溃安全头、原地整理算法、读写锁
+  disk.py      镜像格式、双份崩溃安全头、原地整理算法、逻辑地址对调、读写锁
   seed.py      内置演示镜像（20 槽，14 个在用块 + 6 个空槽）
   web.py       Flask 应用与 HTTP API
-  cli.py       命令行工具（seed/status/verify/compact-once/hard-exit/resume）
+  cli.py       命令行工具（seed/status/verify/compact-once/hard-exit/resume/swap）
   templates/index.html  单页界面
-tests/         19 项单元/集成测试（含并发读、硬崩溃续作、撕裂头恢复）
-scripts/       可复现演示脚本（Docker 版 / 本地版 / 故障注入版）
+tests/         36 项单元/集成测试（含并发读、硬崩溃续作、撕裂头恢复、对调交错）
+scripts/       可复现演示脚本（Docker 版 / 本地版 / 故障注入版 / 整理途中对调）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -89,6 +91,26 @@ python -m app.web                    # 默认 0.0.0.0:8000，DISK_IMAGE/PORT 可
    仅当全部在用块已压紧到前 U 个槽，并再次确认尾部槽表全为 0 后才
    `ftruncate`，不可能截到在用数据。
 
+## 逻辑地址对调（业务区 ⇄ 备用区）
+
+整理页可一次对调两段逻辑地址区间：填**两个起始逻辑块号**和**一个共同块数**，
+例如 `[0,3) ⇄ [11,14)` 把备用区备好的 3 块数据切到业务地址，原业务数据留在
+备用地址；用**同一参数再次对调即可切回**。语义与保证：
+
+1. **只改盘头**：对调只改写槽表里的逻辑块号，物理槽与数据块不动，
+   文件长度不变；整批交换在一次头提交（`pwrite + fsync` + 切换活动副本）
+   中原子生效——对调途中进程退出，重开只能看到**整批交换前或交换后**的
+   布局；已确认成功的对调在重启后仍有效。
+2. **等长、互不相交、未分配一起换**：两段必须等长且区间不重叠（重叠、
+   块数为 0、越界均被 409 拒绝）；区间内未分配的逻辑位置随区间一起交换
+   （交换后对面变为未分配）；区间外映射照旧。适用于槽表仍有空槽的镜像。
+3. **与整理交错**：对调保持各物理槽的空/满分布不变，因此搬移的物理前提
+   不受对调影响；即使整理停在“盘块已搬到目标槽、尚未登记新位置”的中间态，
+   对调也能完成。对调把整理游标归零并递增对调世代号：正在运行的整理步骤
+   发现世代号变化就放弃本次游标推进/截短，按**新的逻辑块号顺序**重新压紧
+   并截短；后续读块按新映射取数。整理已完成后再对调，映射立即生效，
+   重新启动整理即按新顺序压紧。
+
 ## HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -97,6 +119,7 @@ python -m app.web                    # 默认 0.0.0.0:8000，DISK_IMAGE/PORT 可
 | GET | `/api/status` | 状态、实际文件长度、槽位图、游标、搬移/故障计数、临时峰值 |
 | GET | `/api/blocks/<lbn>` | 按逻辑块号读 4 KiB（返回前 64 字节 hex 与可打印预览） |
 | POST | `/api/compact/start` | 启动整理；error 态调用即续作 |
+| POST | `/api/swap` | 对调逻辑地址区间，JSON：`{"a": 0, "b": 11, "count": 3}` |
 | POST | `/api/fault/move` | 一次性注入：下一次搬移抛错 |
 | POST | `/api/fault/truncate` | 一次性注入：下一次截短抛错 |
 | POST | `/api/reseed` | 重建出厂演示镜像（仅非整理中） |
@@ -107,6 +130,10 @@ python -m app.web                    # 默认 0.0.0.0:8000，DISK_IMAGE/PORT 可
 # Docker：真实 SIGKILL 强杀容器，重启后自动续作并校验长度与块内容
 bash scripts/demo_interrupt_resume.sh
 
+# Docker：整理途中对调业务区 ⇄ 备用区，整理按新映射压紧截短，
+# 重启容器后对调仍有效，再对调切回并还原
+bash scripts/demo_swap_docker.sh
+
 # 无 Docker：子进程 os._exit(42) 硬退出模拟 SIGKILL（不执行任何清理），
 # 两次中断后续跑，最后 verify 全部块
 bash scripts/demo_local.sh
@@ -114,6 +141,11 @@ bash scripts/demo_local.sh
 # 故障注入（需要先启动网页）
 bash scripts/demo_fault_injection.sh
 ```
+
+网页手动演示“整理途中对调”：`docker compose up --build` 后打开
+http://localhost:8000 ，点“启动整理”，趁状态为 compacting 时在对调区填
+`0`、`11`、`3` 并点“对调逻辑地址”，观察槽位图按新映射重排、整理继续压紧，
+再读逻辑块 0 验证读到原逻辑块 11 的内容；同一参数再点一次即切回。
 
 > 说明：本项目开发所在的沙箱禁止向进程发送信号，自动化测试里用 `os._exit`
 > 模拟硬崩溃（语义等价：无 finally、无缓冲刷新、无 fd 清理，恢复只依赖已
@@ -123,8 +155,9 @@ bash scripts/demo_fault_injection.sh
 
 ```bash
 python -m unittest discover -s tests -v
-# test_disk: 13 项（格式/整理/故障/并发读/硬崩溃续作/撕裂头/CRC）
-# test_web : 6 项（Flask 接口全链路）
+# test_disk: 27 项（格式/整理/故障/并发读/硬崩溃续作/撕裂头/CRC/
+#                对调语义/对调×整理交错/对调崩溃原子性）
+# test_web : 9 项（Flask 接口全链路，含整理途中对调）
 ```
 
 ## 已知边界

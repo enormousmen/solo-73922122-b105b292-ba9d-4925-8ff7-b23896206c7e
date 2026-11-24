@@ -78,6 +78,16 @@
       <button class="secondary" onclick="reseed()">重建演示镜像</button>
     </div>
     <p class="hint">故障为一次性：报错后状态置为 error，数据仍可读，再点“启动整理”从游标续跑。</p>
+    <h2 style="margin-top:14px">逻辑地址对调（业务区 ⇄ 备用区）</h2>
+    <div class="row">
+      <input id="swapA" type="number" min="0" value="0" aria-label="业务区起始逻辑块号">
+      <input id="swapB" type="number" min="0" value="11" aria-label="备用区起始逻辑块号">
+      <input id="swapN" type="number" min="1" value="3" aria-label="共同块数">
+      <button onclick="swapRanges()">对调逻辑地址</button>
+    </div>
+    <p class="hint">填两个起始逻辑块号和一个共同块数：两段等长且互不相交，未分配的位置随区间一起交换，
+      区间外照旧。对调只改盘头槽表，整理途中也可执行；整理将按新的逻辑块号顺序继续压紧，
+      后续读块按新映射取数。同一参数再次对调即可切回。</p>
     <div id="msg" class="msg"></div>
     <div id="readout"></div>
   </section>
@@ -94,6 +104,7 @@
       <dt>累计搬移次数</dt><dd id="moves">-</dd>
       <dt>故障计数</dt><dd id="errors">-</dd>
       <dt>头世代号</dt><dd id="generation">-</dd>
+      <dt>本进程对调次数</dt><dd id="swaps">-</dd>
       <dt>镜像外临时峰值</dt><dd id="tempPeak">-</dd>
     </dl>
     <h2 style="margin-top:16px">物理槽位图（绿=已压紧，蓝=在用，灰=空槽）</h2>
@@ -130,6 +141,7 @@ async function refresh() {
   document.getElementById('moves').textContent = s.moves;
   document.getElementById('errors').textContent = s.errors;
   document.getElementById('generation').textContent = s.generation;
+  document.getElementById('swaps').textContent = s.swaps;
   document.getElementById('tempPeak').textContent = s.max_temp_bytes + ' 字节';
   document.getElementById('btnStart').disabled = (s.state === 'compacting');
   const wrap = document.getElementById('slots');
@@ -165,6 +177,18 @@ async function startCompact() {
 async function inject(kind) {
   try { say((await api('/api/fault/' + kind, {method:'POST'})).message, 'ok'); }
   catch (e) { say(e.message, 'err'); }
+}
+async function swapRanges() {
+  const a = Number(document.getElementById('swapA').value);
+  const b = Number(document.getElementById('swapB').value);
+  const count = Number(document.getElementById('swapN').value);
+  try {
+    const r = await api('/api/swap', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({a, b, count})});
+    say(r.message + '；同一参数再次对调即可切回', 'ok');
+  } catch (e) { say('对调失败：' + e.message, 'err'); }
+  refresh();
 }
 async function reseed() {
   try { say((await api('/api/reseed', {method:'POST'})).message, 'ok'); refresh(); }

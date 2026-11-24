@@ -89,6 +89,33 @@ def create_app(image_path: str | None = None) -> Flask:
         disk.inject_move_error = True
         return jsonify({"ok": True, "message": "下一次搬移将报错（一次性）"})
 
+    @app.post("/api/swap")
+    def api_swap():
+        """对调两段逻辑地址区间：业务区 ⇄ 备用区，只改盘头槽表。
+
+        整理进行中也可调用；对调后整理按新的逻辑块号顺序继续压紧。
+        """
+        disk = get_disk()
+        body = request.get_json(silent=True) or {}
+        try:
+            start_a = int(body["a"])
+            start_b = int(body["b"])
+            count = int(body["count"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"ok": False,
+                            "error": "需要整数参数 a、b、count"}), 400
+        try:
+            result = disk.swap_ranges(start_a, start_b, count)
+        except DiskError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        return jsonify({
+            "ok": True,
+            "message": (f"已对调 [{start_a},{start_a + count}) ⇄ "
+                        f"[{start_b},{start_b + count})，"
+                        f"重登记 {result['remapped_slots']} 个槽"),
+            **result,
+        })
+
     @app.post("/api/fault/truncate")
     def api_fault_truncate():
         disk = get_disk()

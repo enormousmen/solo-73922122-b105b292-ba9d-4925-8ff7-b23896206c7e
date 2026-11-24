@@ -122,6 +122,66 @@ class WebApiTest(unittest.TestCase):
         self.assertEqual(st["file_size"], DATA_OFFSET + 20 * BLOCK_SIZE)
         self.assertEqual(st["state"], "idle")
 
+    def test_swap_api_and_switch_back(self):
+        r = self.client.post("/api/swap",
+                             json={"a": 0, "b": 11, "count": 3})
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["remapped_slots"], 6)
+        # 业务地址读到备好的数据，原业务数据留在备用地址。
+        resp = self.client.get("/api/blocks/0").get_json()
+        self.assertEqual(bytes.fromhex(resp["hex"]),
+                         block_content(11)[:64])
+        resp = self.client.get("/api/blocks/11").get_json()
+        self.assertEqual(bytes.fromhex(resp["hex"]),
+                         block_content(0)[:64])
+        # 同一操作切回。
+        r = self.client.post("/api/swap",
+                             json={"a": 0, "b": 11, "count": 3})
+        self.assertEqual(r.status_code, 200)
+        resp = self.client.get("/api/blocks/0").get_json()
+        self.assertEqual(bytes.fromhex(resp["hex"]),
+                         block_content(0)[:64])
+
+    def test_swap_api_invalid_args(self):
+        # 缺参数 / 非整数 → 400
+        self.assertEqual(self.client.post("/api/swap", json={}).status_code,
+                         400)
+        self.assertEqual(self.client.post(
+            "/api/swap", json={"a": "x", "b": 1, "count": 1}).status_code,
+            400)
+        # 区间重叠、块数为 0 → 409
+        self.assertEqual(self.client.post(
+            "/api/swap", json={"a": 2, "b": 3, "count": 2}).status_code, 409)
+        self.assertEqual(self.client.post(
+            "/api/swap", json={"a": 0, "b": 5, "count": 0}).status_code, 409)
+        # 非法调用不改动任何映射。
+        resp = self.client.get("/api/blocks/0").get_json()
+        self.assertEqual(bytes.fromhex(resp["hex"]),
+                         block_content(0)[:64])
+
+    def test_swap_api_during_compaction(self):
+        # 放慢搬移，制造整理途中对调的窗口。
+        self.client.get("/api/status")
+        disk = self.app.config["DISK"]
+        disk.move_delay = 0.02
+        self.client.post("/api/compact/start")
+        r = self.client.post("/api/swap",
+                             json={"a": 0, "b": 11, "count": 3})
+        self.assertEqual(r.status_code, 200)
+        st = self._wait_state("idle")
+        self.assertEqual(st["file_size"], DATA_OFFSET + 14 * BLOCK_SIZE)
+        self.assertEqual(st["swaps"], 1)
+        # 整理按新映射完成，读块按新映射取数。
+        resp = self.client.get("/api/blocks/0").get_json()
+        self.assertEqual(bytes.fromhex(resp["hex"]),
+                         block_content(11)[:64])
+        resp = self.client.get("/api/blocks/11").get_json()
+        self.assertEqual(bytes.fromhex(resp["hex"]),
+                         block_content(0)[:64])
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
